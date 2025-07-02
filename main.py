@@ -8,7 +8,7 @@ import uvicorn
 
 # Load environment variables
 openai.api_key = os.getenv("OPENAI_API_KEY")
-whatsapp_token = os.getenv("WHATSAPP_TOKEN")
+whatsapp_token = os.getenv("ACCESS_TOKEN")
 phone_number_id = os.getenv("PHONE_NUMBER_ID")
 
 app = FastAPI()
