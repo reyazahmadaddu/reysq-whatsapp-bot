@@ -13,7 +13,7 @@ phone_number_id = os.getenv("PHONE_NUMBER_ID")
 
 app = FastAPI()
 
-# Define reysQ’s personality prompt
+# reysQ’s personality prompt
 system_prompt = """
 You are reysQ, a warm, intelligent AI health companion — like a friendly junior doctor trained in medical triage.
 
@@ -50,7 +50,6 @@ def send_whatsapp_message(to_number: str, reply_text: str):
     print(f"📤 WhatsApp API response: {response.status_code} {response.text}")
     return response.status_code
 
-
 @app.post("/webhook")
 async def webhook(request: Request):
     try:
@@ -68,7 +67,7 @@ async def webhook(request: Request):
 
             print(f"📩 From {sender_id}: {user_message}")
 
-            # OpenAI call with flex priority
+            # Call OpenAI for reysQ's reply
             try:
                 response = openai.ChatCompletion.create(
                     model="gpt-4o",
@@ -81,9 +80,7 @@ async def webhook(request: Request):
                     top_p=1,
                     frequency_penalty=0,
                     presence_penalty=0,
-                    timeout=10,
-                    extra_headers={"OpenAI-Beta": "assistants=v1"},  # Optional
-                    extra_body={"priority": "flex"}
+                    timeout=10
                 )
 
                 reply_text = response['choices'][0]['message']['content'].strip()
@@ -93,7 +90,7 @@ async def webhook(request: Request):
                 print("❌ OpenAI error:", str(e))
                 reply_text = "Sorry, I couldn’t respond right now. Please try again in a moment."
 
-            # Send reply via WhatsApp
+            # Send GPT reply via WhatsApp
             send_status = send_whatsapp_message(sender_id, reply_text)
 
         return JSONResponse(status_code=200, content={"status": "received"})
