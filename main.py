@@ -60,7 +60,7 @@ async def generate_reply(user_input):
                     "Content-Type": "application/json"
                 },
                 json={
-                    "model": "gpt-4",
+                    "model": "gpt-3.5-turbo",
                     "messages": [
                         {"role": "system", "content": "You are reysQ, a compassionate AI health assistant. Respond with empathy, helpful suggestions, and ask follow-up questions if needed."},
                         {"role": "user", "content": user_input}
