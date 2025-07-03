@@ -1,4 +1,3 @@
-
 import os
 from openai import OpenAI
 from fastapi import FastAPI, Request
@@ -8,26 +7,21 @@ from typing import List, Dict
 from tinydb import TinyDB, Query
 import uvicorn
 import httpx
-import re
+import tempfile
+import asyncio
 
-# Load environment variables
+# Load environment
 load_dotenv()
-
 app = FastAPI()
 
-# OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-# Meta config
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 
-# TinyDB setup
 db = TinyDB("memory.json")
 UserMemory = Query()
 
-# System prompt
 SYSTEM_PROMPT = {
     "role": "system",
     "content": """
@@ -57,16 +51,6 @@ You're not a doctor — you’re their caring, memory-aware health companion.
 """
 }
 
-# Language detection
-def detect_language(text: str) -> str:
-    if re.search(r'[ऀ-ॿ]', text):
-        return "hi"  # Hindi (Devanagari)
-    elif re.search(r'\b(kya|kaise|nahi|haan|dard|theek|thik|hai|hoon)\b', text.lower()):
-        return "roman-hindi"
-    else:
-        return "en"
-
-# Meta verification
 @app.get("/")
 async def verify_webhook(request: Request):
     params = dict(request.query_params)
@@ -74,22 +58,39 @@ async def verify_webhook(request: Request):
         return int(params.get("hub.challenge"))
     return {"status": "unauthorized"}
 
-# Summary generator
 async def summarize_messages(messages: List[Dict]) -> str:
     try:
         response = client.chat.completions.create(
             model="gpt-3.5-turbo-1106",
-            messages=[
-                {"role": "system", "content": "Summarize this conversation in a short clinical memory, preserving key symptoms, plans, and tone."},
-                *messages
-            ],
+            messages=[{"role": "system", "content": "Summarize this conversation in a short clinical memory, preserving key symptoms, plans, and tone."}] + messages,
             max_tokens=150
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
         return "Summary failed. Memory cleared."
 
-# Webhook handler
+async def transcribe_audio(media_id: str) -> str:
+    # Step 1: Get media URL
+    url = f"https://graph.facebook.com/v19.0/{media_id}"
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+    async with httpx.AsyncClient() as client_http:
+        res = await client_http.get(url, headers=headers)
+        media_url = res.json().get("url")
+
+        # Step 2: Download the audio file
+        media_res = await client_http.get(media_url, headers=headers)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as tmp:
+            tmp.write(media_res.content)
+            tmp_path = tmp.name
+
+    # Step 3: Transcribe with Whisper
+    with open(tmp_path, "rb") as audio_file:
+        transcript = client.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_file
+        )
+    return transcript.text
+
 @app.post("/webhook")
 async def webhook(request: Request):
     data = await request.json()
@@ -102,48 +103,38 @@ async def webhook(request: Request):
             return {"status": "no message"}
 
         msg = messages[0]
-        user_text = msg["text"]["body"]
         user_id = msg["from"]
+        msg_type = msg.get("type")
 
-        detected_lang = detect_language(user_text)
+        if msg_type == "text":
+            user_text = msg["text"]["body"]
 
-        # Load or create memory
+        elif msg_type == "audio":
+            media_id = msg["audio"]["id"]
+            user_text = await transcribe_audio(media_id)
+
+        else:
+            user_text = "Unsupported message type."
+
+        # Retrieve memory
         record = db.get(UserMemory.user_id == user_id)
         chat_history = record["messages"] if record else []
         chat_history.append({"role": "user", "content": user_text})
 
-        # Prune if needed
+        # Prune
         if len(chat_history) > 8:
             summary = await summarize_messages(chat_history)
             chat_history = [{"role": "assistant", "content": summary}]
 
-        # Add dynamic language prompt
-        language_prompt = None
-        if detected_lang == "en":
-            language_prompt = {
-                "role": "system",
-                "content": "The user is speaking in English. Please reply in English using warm and supportive tone like a health companion."
-            }
-        elif detected_lang == "roman-hindi":
-            language_prompt = {
-                "role": "system",
-                "content": "User is speaking in Roman Hindi. Please reply in Roman Hindi using clear and friendly tone."
-            }
-
-        final_messages = [SYSTEM_PROMPT]
-        if language_prompt:
-            final_messages.append(language_prompt)
-        final_messages += chat_history
-
-        # Call OpenAI API
+        # GPT response
         response = client.chat.completions.create(
             model="gpt-3.5-turbo-1106",
-            messages=final_messages,
+            messages=[SYSTEM_PROMPT] + chat_history,
             max_tokens=500
         )
         reply = response.choices[0].message.content.strip()
 
-        # Save reply
+        # Save memory
         chat_history.append({"role": "assistant", "content": reply})
         if record:
             db.update({"messages": chat_history}, UserMemory.user_id == user_id)
@@ -151,7 +142,6 @@ async def webhook(request: Request):
             db.insert({"user_id": user_id, "messages": chat_history})
 
         # Send reply to WhatsApp
-        url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
         headers = {
             "Authorization": f"Bearer {ACCESS_TOKEN}",
             "Content-Type": "application/json"
@@ -164,13 +154,12 @@ async def webhook(request: Request):
         }
 
         async with httpx.AsyncClient() as client_http:
-            await client_http.post(url, headers=headers, json=payload)
+            await client_http.post(f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages", headers=headers, json=payload)
 
     except Exception as e:
         print("Error:", e)
 
     return {"status": "ok"}
 
-# Run server
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=10000)
