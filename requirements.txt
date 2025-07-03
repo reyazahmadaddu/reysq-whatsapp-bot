@@ -2,5 +2,7 @@ fastapi
 uvicorn
 python-dotenv
 httpx
-openai>=1.14.2
+openai>=1.0.0
 tinydb
+requests
+pydantic
