@@ -78,35 +78,14 @@ async def summarize_messages(messages: List[Dict]) -> str:
     except Exception as e:
         return "Summary failed. Memory cleared."
 
-# Roman Hindi detection
-async def is_roman_hindi(text: str) -> bool:
-    try:
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo-1106",
-            messages=[
-                {"role": "system", "content": "Is the following sentence written in Roman Hindi (Hindi in Latin script)? Reply only with 'yes' or 'no'."},
-                {"role": "user", "content": text}
-            ],
-            max_tokens=1
-        )
-        return "yes" in response.choices[0].message.content.strip().lower()
-    except:
-        return False
-
-# Transliteration
-async def transliterate_to_roman(text: str) -> str:
-    try:
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo-1106",
-            messages=[
-                {"role": "system", "content": "Transliterate this Hindi message to Roman Hindi (Hindi written in English letters). Do not translate, just convert script."},
-                {"role": "user", "content": text}
-            ],
-            max_tokens=500
-        )
-        return response.choices[0].message.content.strip()
-    except:
-        return text
+# Detect Roman Hindi input
+def is_roman_hindi(text):
+    hindi_words = ["hai", "kaise", "kya", "nahi", "batao", "mat", "tabiyat", "bhai", "theek", "pucho", "haal"]
+    if all(ord(c) < 128 for c in text):  # Only ASCII
+        for word in hindi_words:
+            if word in text.lower():
+                return True
+    return False
 
 # Webhook handler
 @app.post("/webhook")
@@ -124,9 +103,6 @@ async def webhook(request: Request):
         user_text = msg["text"]["body"]
         user_id = msg["from"]
 
-        # Check if Roman Hindi
-        is_roman = await is_roman_hindi(user_text)
-
         # Load or create memory
         record = db.get(UserMemory.user_id == user_id)
         chat_history = record["messages"] if record else []
@@ -137,6 +113,13 @@ async def webhook(request: Request):
             summary = await summarize_messages(chat_history)
             chat_history = [{"role": "assistant", "content": summary}]
 
+        # Roman Hindi detection
+        if is_roman_hindi(user_text):
+            chat_history.insert(0, {
+                "role": "system",
+                "content": "User is messaging in Hindi using Roman script. Please respond in Roman Hindi as well — no English or Devanagari."
+            })
+
         # Call OpenAI API
         response = client.chat.completions.create(
             model="gpt-3.5-turbo-1106",
@@ -144,10 +127,6 @@ async def webhook(request: Request):
             max_tokens=500
         )
         reply = response.choices[0].message.content.strip()
-
-        # Transliterate if needed
-        if is_roman:
-            reply = await transliterate_to_roman(reply)
 
         # Save reply
         chat_history.append({"role": "assistant", "content": reply})
