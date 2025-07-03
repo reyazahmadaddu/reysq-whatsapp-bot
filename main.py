@@ -12,20 +12,15 @@ import httpx
 load_dotenv()
 
 app = FastAPI()
-
-# OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# Meta config
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 
-# TinyDB setup
 db = TinyDB("memory.json")
 UserMemory = Query()
 
-# System prompt
 SYSTEM_PROMPT = {
     "role": "system",
     "content": """
@@ -55,7 +50,7 @@ You're not a doctor — you’re their caring, memory-aware health companion.
 """
 }
 
-# Meta verification
+
 @app.get("/")
 async def verify_webhook(request: Request):
     params = dict(request.query_params)
@@ -63,7 +58,39 @@ async def verify_webhook(request: Request):
         return int(params.get("hub.challenge"))
     return {"status": "unauthorized"}
 
-# Summary generator
+
+# Helper: Detect language
+async def detect_language(text: str) -> str:
+    try:
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo-1106",
+            messages=[
+                {"role": "system", "content": "Detect the language of the user message. Reply only in ISO 639-1 code (like 'en', 'hi', 'bh')."},
+                {"role": "user", "content": text}
+            ],
+            max_tokens=2
+        )
+        lang_code = response.choices[0].message.content.strip().lower()
+        return lang_code
+    except:
+        return "en"
+
+
+# Helper: Translate message
+async def translate(text: str, target_lang: str) -> str:
+    try:
+        prompt = f"Translate the following message into {target_lang}:\n\n{text}"
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo-1106",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=500
+        )
+        return response.choices[0].message.content.strip()
+    except:
+        return text
+
+
+# Summarize past chat history
 async def summarize_messages(messages: List[Dict]) -> str:
     try:
         response = client.chat.completions.create(
@@ -75,10 +102,10 @@ async def summarize_messages(messages: List[Dict]) -> str:
             max_tokens=150
         )
         return response.choices[0].message.content.strip()
-    except Exception as e:
+    except:
         return "Summary failed. Memory cleared."
 
-# Webhook handler
+
 @app.post("/webhook")
 async def webhook(request: Request):
     data = await request.json()
@@ -94,17 +121,23 @@ async def webhook(request: Request):
         user_text = msg["text"]["body"]
         user_id = msg["from"]
 
+        # Detect language
+        lang_code = await detect_language(user_text)
+        original_text = user_text
+
+        if lang_code in ["hi", "bh"]:  # Translate Hindi or Bhojpuri to English
+            user_text = await translate(user_text, "English")
+
         # Load or create memory
         record = db.get(UserMemory.user_id == user_id)
         chat_history = record["messages"] if record else []
         chat_history.append({"role": "user", "content": user_text})
 
-        # Prune if needed
         if len(chat_history) > 8:
             summary = await summarize_messages(chat_history)
             chat_history = [{"role": "assistant", "content": summary}]
 
-        # Call OpenAI API
+        # Call OpenAI
         response = client.chat.completions.create(
             model="gpt-3.5-turbo-1106",
             messages=[SYSTEM_PROMPT] + chat_history,
@@ -112,14 +145,18 @@ async def webhook(request: Request):
         )
         reply = response.choices[0].message.content.strip()
 
-        # Save reply
+        # Translate reply back to user language
+        if lang_code in ["hi", "bh"]:
+            reply = await translate(reply, "Hindi")
+
+        # Save memory
         chat_history.append({"role": "assistant", "content": reply})
         if record:
             db.update({"messages": chat_history}, UserMemory.user_id == user_id)
         else:
             db.insert({"user_id": user_id, "messages": chat_history})
 
-        # Send reply to WhatsApp
+        # Send WhatsApp message
         url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
         headers = {
             "Authorization": f"Bearer {ACCESS_TOKEN}",
@@ -140,6 +177,6 @@ async def webhook(request: Request):
 
     return {"status": "ok"}
 
-# Run server
+
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=10000)
