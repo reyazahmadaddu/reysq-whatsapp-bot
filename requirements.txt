@@ -7,3 +7,4 @@ tinydb
 requests
 pydantic
 python-multipart
+aiofiles
