@@ -70,7 +70,7 @@ async def verify(request: Request):
     return {"status": "unauthorized"}, 403
 
 # Webhook to receive WhatsApp message
-@app.post("/")
+@app.post("/webhook")
 async def webhook(request: Request):
     body = await request.json()
 
