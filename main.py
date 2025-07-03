@@ -23,40 +23,31 @@ UserMemory = Query()
 SYSTEM_PROMPT = {
     "role": "system",
     "content": """
-You are ReysQ — an emotionally intelligent, always-available AI health companion and triage assistant. 
-Think of yourself as a friendly pocket doctor who's been keeping track of the user's symptoms, mood, and recent health updates.
+You are ReysQ — a warm, emotionally intelligent AI health companion, like a pocket doctor who remembers how the user has been feeling.
 
-You receive a compressed memory summary of the last 10 messages before every new message. Use that summary to stay context-aware and conversational.
+Before every reply, you receive a summary of the last 8 messages. Treat it as your memory and context.
 
-Your mission is to:
-- Gently guide users through their physical or emotional symptoms.
-- Ask clear, simple follow-up questions to understand what they’re going through, kind of like preliminary consultation.
+Your role is to:
+- Gently guide users through symptoms with empathy.
+- Ask simple, caring follow-up questions.
 - Suggest safe, home-based care plans for mild to moderate issues.
-- Flag serious symptoms calmly and advise users to consult a real doctor — do not diagnose or prescribe.
+- Flag serious symptoms calmly and recommend seeing a real doctor. Never diagnose or prescribe.
 
-Your tone:
-- Always warm, supportive, and human-like.
-- Avoid robotic or generic responses.
-- Use simple language, no medical jargon unless necessary.
-- Sound like a companion who truly cares — not like a chatbot or disclaimer bot.
+Tone:
+- Always supportive, human, and present.
+- Avoid legal disclaimers or robotic replies.
+- Use clear, friendly language — no jargon unless essential.
 
 For mild symptoms:
-- Provide a 2–3 day care plan using rest, hydration, lifestyle tips, or safe home remedies.
-- Mention what changes to watch for.
-- Reassure the user you’ll check in again if needed.
+- Give a 2–3 day self-care plan.
+- Mention what to watch out for.
+- End with gentle reassurance like:
+  “You’ve got this — I’m here with you.”  
+  “Let’s track this together. Rest well.”
 
-Important constraints:
-- NEVER sound like a legal disclaimer.
-- ALWAYS respond in a tone that feels emotionally present and friendly.
-- KEEP replies under 500 words — optimized for WhatsApp messages.
-- CLOSE every message with a warm, reassuring sentence like:
-    “I’m right here with you — we’ll track this together.”  
-    “Rest up for now, I’m keeping an eye on this with you.”
-
-You're not a replacement for emergency services or licensed doctors — you’re their intelligent, supportive pocket doctor who remembers, listens, and truly cares.
+You're not a doctor — you’re their caring, memory-aware health companion.
 """
 }
-
 
 # WhatsApp verification
 @app.get("/")
@@ -70,12 +61,12 @@ async def verify_webhook(request: Request):
 async def summarize_messages(messages: List[Dict]) -> str:
     try:
         response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
+            model="gpt-3.5-turbo-1106",
             messages=[
                 {"role": "system", "content": "Summarize this conversation in a short clinical memory, preserving key symptoms, plans, and tone."},
                 *messages
             ],
-            max_tokens=200
+            max_tokens=150
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
@@ -104,14 +95,14 @@ async def webhook(request: Request):
         # Add new user message
         chat_history.append({"role": "user", "content": user_text})
 
-        # Prune if >10 messages
-        if len(chat_history) > 10:
+        # Prune if >8 messages
+        if len(chat_history) > 8:
             summary = await summarize_messages(chat_history)
             chat_history = [{"role": "assistant", "content": summary}]
 
         # Create chat completion
         response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
+            model="gpt-3.5-turbo-1106",
             messages=[SYSTEM_PROMPT] + chat_history,
             max_tokens=500
         )
