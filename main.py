@@ -1,4 +1,10 @@
-import os import openai from fastapi import FastAPI, Request from pydantic import BaseModel from tinydb import TinyDB, Query import uvicorn import requests
+import os 
+import openai from fastapi 
+import FastAPI, Request from pydantic 
+import BaseModel from tinydb 
+import TinyDB, Query 
+import uvicorn 
+import requests
 
 app = FastAPI() db = TinyDB("db.json")
 
