@@ -1,3 +1,4 @@
+
 import os
 from openai import OpenAI
 from fastapi import FastAPI, Request
@@ -7,6 +8,7 @@ from typing import List, Dict
 from tinydb import TinyDB, Query
 import uvicorn
 import httpx
+import re
 
 # Load environment variables
 load_dotenv()
@@ -55,6 +57,15 @@ You're not a doctor — you’re their caring, memory-aware health companion.
 """
 }
 
+# Language detection
+def detect_language(text: str) -> str:
+    if re.search(r'[ऀ-ॿ]', text):
+        return "hi"  # Hindi (Devanagari)
+    elif re.search(r'\b(kya|kaise|nahi|haan|dard|theek|thik|hai|hoon)\b', text.lower()):
+        return "roman-hindi"
+    else:
+        return "en"
+
 # Meta verification
 @app.get("/")
 async def verify_webhook(request: Request):
@@ -78,15 +89,6 @@ async def summarize_messages(messages: List[Dict]) -> str:
     except Exception as e:
         return "Summary failed. Memory cleared."
 
-# Detect Roman Hindi input
-def is_roman_hindi(text):
-    hindi_words = ["hai", "kaise", "kya", "nahi", "batao", "mat", "tabiyat", "bhai", "theek", "pucho", "haal"]
-    if all(ord(c) < 128 for c in text):  # Only ASCII
-        for word in hindi_words:
-            if word in text.lower():
-                return True
-    return False
-
 # Webhook handler
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -103,6 +105,8 @@ async def webhook(request: Request):
         user_text = msg["text"]["body"]
         user_id = msg["from"]
 
+        detected_lang = detect_language(user_text)
+
         # Load or create memory
         record = db.get(UserMemory.user_id == user_id)
         chat_history = record["messages"] if record else []
@@ -113,17 +117,28 @@ async def webhook(request: Request):
             summary = await summarize_messages(chat_history)
             chat_history = [{"role": "assistant", "content": summary}]
 
-        # Roman Hindi detection
-        if is_roman_hindi(user_text):
-            chat_history.insert(0, {
+        # Add dynamic language prompt
+        language_prompt = None
+        if detected_lang == "en":
+            language_prompt = {
                 "role": "system",
-                "content": "User is messaging in Hindi using Roman script. Please respond in Roman Hindi as well — no English or Devanagari."
-            })
+                "content": "The user is speaking in English. Please reply in English using warm and supportive tone like a health companion."
+            }
+        elif detected_lang == "roman-hindi":
+            language_prompt = {
+                "role": "system",
+                "content": "User is speaking in Roman Hindi. Please reply in Roman Hindi using clear and friendly tone."
+            }
+
+        final_messages = [SYSTEM_PROMPT]
+        if language_prompt:
+            final_messages.append(language_prompt)
+        final_messages += chat_history
 
         # Call OpenAI API
         response = client.chat.completions.create(
             model="gpt-3.5-turbo-1106",
-            messages=[SYSTEM_PROMPT] + chat_history,
+            messages=final_messages,
             max_tokens=500
         )
         reply = response.choices[0].message.content.strip()
