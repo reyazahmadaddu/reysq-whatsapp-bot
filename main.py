@@ -1,16 +1,22 @@
 import os
-import openai
+from openai import OpenAI
 from fastapi import FastAPI, Request
 from dotenv import load_dotenv
 from pydantic import BaseModel
 from typing import List, Dict
 from tinydb import TinyDB, Query
 import uvicorn
+import httpx
 
+# Load environment variables
 load_dotenv()
 
 app = FastAPI()
-openai.api_key = os.getenv("OPENAI_API_KEY")
+
+# OpenAI client
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# Meta config
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
@@ -49,7 +55,7 @@ You're not a doctor — you’re their caring, memory-aware health companion.
 """
 }
 
-# WhatsApp verification
+# Meta verification
 @app.get("/")
 async def verify_webhook(request: Request):
     params = dict(request.query_params)
@@ -57,10 +63,10 @@ async def verify_webhook(request: Request):
         return int(params.get("hub.challenge"))
     return {"status": "unauthorized"}
 
-# Summarize function
+# Summary generator
 async def summarize_messages(messages: List[Dict]) -> str:
     try:
-        response = openai.ChatCompletion.create(
+        response = client.chat.completions.create(
             model="gpt-3.5-turbo-1106",
             messages=[
                 {"role": "system", "content": "Summarize this conversation in a short clinical memory, preserving key symptoms, plans, and tone."},
@@ -72,7 +78,7 @@ async def summarize_messages(messages: List[Dict]) -> str:
     except Exception as e:
         return "Summary failed. Memory cleared."
 
-# WhatsApp webhook
+# Webhook handler
 @app.post("/webhook")
 async def webhook(request: Request):
     data = await request.json()
@@ -88,37 +94,32 @@ async def webhook(request: Request):
         user_text = msg["text"]["body"]
         user_id = msg["from"]
 
-        # Retrieve memory
+        # Load or create memory
         record = db.get(UserMemory.user_id == user_id)
         chat_history = record["messages"] if record else []
-
-        # Add new user message
         chat_history.append({"role": "user", "content": user_text})
 
-        # Prune if >8 messages
+        # Prune if needed
         if len(chat_history) > 8:
             summary = await summarize_messages(chat_history)
             chat_history = [{"role": "assistant", "content": summary}]
 
-        # Create chat completion
-        response = openai.ChatCompletion.create(
+        # Call OpenAI API
+        response = client.chat.completions.create(
             model="gpt-3.5-turbo-1106",
             messages=[SYSTEM_PROMPT] + chat_history,
             max_tokens=500
         )
         reply = response.choices[0].message.content.strip()
 
-        # Append assistant reply to history
+        # Save reply
         chat_history.append({"role": "assistant", "content": reply})
-
-        # Save updated history
         if record:
             db.update({"messages": chat_history}, UserMemory.user_id == user_id)
         else:
             db.insert({"user_id": user_id, "messages": chat_history})
 
-        # Send WhatsApp reply
-        import httpx
+        # Send reply to WhatsApp
         url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
         headers = {
             "Authorization": f"Bearer {ACCESS_TOKEN}",
@@ -131,13 +132,14 @@ async def webhook(request: Request):
             "text": {"body": reply}
         }
 
-        async with httpx.AsyncClient() as client:
-            await client.post(url, headers=headers, json=payload)
+        async with httpx.AsyncClient() as client_http:
+            await client_http.post(url, headers=headers, json=payload)
 
     except Exception as e:
         print("Error:", e)
 
     return {"status": "ok"}
 
+# Run server
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=10000)
