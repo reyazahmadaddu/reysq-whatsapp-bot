@@ -1,4 +1,5 @@
 import os
+from openai import OpenAI
 from fastapi import FastAPI, Request
 from dotenv import load_dotenv
 from pydantic import BaseModel
@@ -6,20 +7,17 @@ from typing import List, Dict
 from tinydb import TinyDB, Query
 import uvicorn
 import httpx
-from openai import OpenAI
+import asyncio
 
-# Load environment variables
 load_dotenv()
 
 app = FastAPI()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# Meta config
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 
-# TinyDB setup
 db = TinyDB("memory.json")
 UserMemory = Query()
 
@@ -42,7 +40,6 @@ Keep replies short enough to be sent via WhatsApp.
 """
 }
 
-# Verification
 @app.get("/")
 async def verify_webhook(request: Request):
     params = dict(request.query_params)
@@ -50,32 +47,32 @@ async def verify_webhook(request: Request):
         return int(params.get("hub.challenge"))
     return {"status": "unauthorized"}
 
-# Summarize last 8 messages
 async def summarize_messages(messages: List[Dict]) -> str:
     try:
-        summary_response = client.chat.completions.create(
+        response = client.chat.completions.create(
             model="gpt-3.5-turbo-1106",
             messages=[
-                {"role": "system", "content": "Summarize this conversation in a short clinical memory, preserving key symptoms, mood, advice, and emotional tone."},
+                {"role": "system", "content": "Summarize this conversation in a short clinical memory, preserving key symptoms, plans, and tone."},
                 *messages
             ],
-            max_tokens=200
+            max_tokens=150
         )
-        return summary_response.choices[0].message.content.strip()
+        return response.choices[0].message.content.strip()
     except Exception as e:
         return "Summary failed. Memory cleared."
 
-# Text-to-Speech (female voice)
-async def generate_voice(text: str, filename: str = "voice_reply.mp3"):
-    response = client.audio.speech.create(
-        model="tts-1-hd",
-        voice="nova",  # Female-sounding voice
-        input=text
-    )
-    with open(filename, "wb") as f:
-        f.write(response.content)
+async def generate_voice(text: str) -> bytes:
+    try:
+        response = client.audio.speech.create(
+            model="tts-1",
+            voice="nova",  # Female voice
+            input=text
+        )
+        return response.read()
+    except Exception as e:
+        print("TTS Error:", e)
+        return None
 
-# WhatsApp webhook
 @app.post("/webhook")
 async def webhook(request: Request):
     data = await request.json()
@@ -88,89 +85,71 @@ async def webhook(request: Request):
             return {"status": "no message"}
 
         msg = messages[0]
-        user_text = msg["text"]["body"]
-        user_id = msg["from"]
+        user_text = msg.get("text", {}).get("body")
+        user_id = msg.get("from")
+
+        if not user_text:
+            return {"status": "no user text found"}
 
         # Load memory
         record = db.get(UserMemory.user_id == user_id)
         chat_history = record["messages"] if record else []
         chat_history.append({"role": "user", "content": user_text})
 
-        # Summarize if over 8 messages
+        # Prune & summarize if needed
         if len(chat_history) > 8:
             summary = await summarize_messages(chat_history)
             chat_history = [{"role": "assistant", "content": summary}]
 
-        # Generate reply
-        reply_response = client.chat.completions.create(
+        # Get GPT reply
+        response = client.chat.completions.create(
             model="gpt-3.5-turbo-1106",
             messages=[SYSTEM_PROMPT] + chat_history,
             max_tokens=500
         )
-        reply_text = reply_response.choices[0].message.content.strip()
+        reply = response.choices[0].message.content.strip()
+        chat_history.append({"role": "assistant", "content": reply})
 
-        # Save reply
-        chat_history.append({"role": "assistant", "content": reply_text})
+        # Update memory
         if record:
             db.update({"messages": chat_history}, UserMemory.user_id == user_id)
         else:
             db.insert({"user_id": user_id, "messages": chat_history})
 
-        # Generate voice
-        await generate_voice(reply_text)
-        audio_url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/media"
+        # Send text reply
+        send_url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
         headers = {
-            "Authorization": f"Bearer {ACCESS_TOKEN}"
+            "Authorization": f"Bearer {ACCESS_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": user_id,
+            "type": "text",
+            "text": {"body": reply}
         }
 
-        # Upload voice to WhatsApp
-        with open("voice_reply.mp3", "rb") as file:
-            files = {"file": ("voice_reply.mp3", file, "audio/mpeg")}
-            data = {
-                "messaging_product": "whatsapp",
-                "type": "audio"
+        async with httpx.AsyncClient() as client_http:
+            await client_http.post(send_url, headers=headers, json=payload)
+
+        # Generate and send voice reply
+        voice_data = await generate_voice(reply)
+        if voice_data:
+            audio_headers = {
+                "Authorization": f"Bearer {ACCESS_TOKEN}"
             }
-            async with httpx.AsyncClient() as client_http:
-                audio_upload = await client_http.post(audio_url, headers=headers, data=data, files=files)
-                media_id = audio_upload.json().get("id")
-
-        # Send text
-        async with httpx.AsyncClient() as client_http:
-            await client_http.post(
-                f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages",
-                headers={
-                    "Authorization": f"Bearer {ACCESS_TOKEN}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "messaging_product": "whatsapp",
-                    "to": user_id,
-                    "type": "text",
-                    "text": {"body": reply_text}
-                }
-            )
-
-        # Send audio
-        async with httpx.AsyncClient() as client_http:
-            await client_http.post(
-                f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages",
-                headers={
-                    "Authorization": f"Bearer {ACCESS_TOKEN}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "messaging_product": "whatsapp",
-                    "to": user_id,
-                    "type": "audio",
-                    "audio": {"id": media_id}
-                }
-            )
+            audio_payload = {
+                "messaging_product": "whatsapp",
+                "to": user_id,
+                "type": "audio",
+                "audio": {"link": "data:audio/ogg;base64," + voice_data.encode("base64")}
+            }
+            await client_http.post(send_url, headers=audio_headers, json=audio_payload)
 
     except Exception as e:
         print("Error:", e)
 
     return {"status": "ok"}
 
-# Run
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=10000)
