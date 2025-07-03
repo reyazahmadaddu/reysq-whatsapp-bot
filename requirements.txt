@@ -3,3 +3,6 @@ uvicorn
 python-dotenv
 httpx
 openai==0.28
+tinydb
+requests
+pydantic
