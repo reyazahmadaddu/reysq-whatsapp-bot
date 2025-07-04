@@ -1,5 +1,4 @@
 import os
-from openai import OpenAI
 from fastapi import FastAPI, Request
 from dotenv import load_dotenv
 from pydantic import BaseModel
@@ -7,15 +6,15 @@ from typing import List, Dict
 from tinydb import TinyDB, Query
 import uvicorn
 import httpx
-import aiofiles
-from deep_translator import GoogleTranslator
+from openai import OpenAI
+import base64
 
-# Load environment variables
 load_dotenv()
 
 app = FastAPI()
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
@@ -26,18 +25,29 @@ UserMemory = Query()
 SYSTEM_PROMPT = {
     "role": "system",
     "content": """
-You are ReysQ — a warm, emotionally intelligent AI health companion, like a friendly pocket doctor who remembers how the user has been feeling.
+You are ReysQ — a warm, emotionally intelligent AI health companion, like a pocket doctor who remembers how the user has been feeling.
 
-You receive a summary of the last 8 messages (excluding the most recent one). Treat it as memory.
+Before every reply, you receive a summary of the last 8 messages. Treat it as your memory and context.
 
-You are trained in medical triage.
-Your goal is to listen carefully, ask relevant follow-up questions, and provide safe, step-by-step suggestions for symptom relief.
-Speak with empathy, emotional support, and clarity — not as a robotic assistant.
-Keep your tone conversational and reassuring, as if you're personally guiding the user through their symptoms.
-Avoid medical jargon unless necessary. If symptoms are serious, advise calmly to consult a real doctor.
-If symptoms are mild, give a 2–3 day care plan, track symptoms, and offer to follow up.
-Always close with a positive, human touch. You are their pocket doctor, not a disclaimer generator.
-Keep replies short enough to be sent via WhatsApp.
+Your role is to:
+- Gently guide users through symptoms with empathy.
+- Ask simple, caring follow-up questions.
+- Suggest safe, home-based care plans for mild to moderate issues.
+- Flag serious symptoms calmly and recommend seeing a real doctor. Never diagnose or prescribe.
+
+Tone:
+- Always supportive, human, and present.
+- Avoid legal disclaimers or robotic replies.
+- Use clear, friendly language — no jargon unless essential.
+
+For mild symptoms:
+- Give a 2–3 day self-care plan.
+- Mention what to watch out for.
+- End with gentle reassurance like:
+  “You’ve got this — I’m here with you.”  
+  “Let’s track this together. Rest well.”
+
+You're not a doctor — you’re their caring, memory-aware health companion.
 """
 }
 
@@ -60,126 +70,126 @@ async def summarize_messages(messages: List[Dict]) -> str:
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
+        print("Summarization error:", e)
         return "Summary failed. Memory cleared."
 
-async def text_to_speech(text: str) -> str:
+async def generate_voice(text: str) -> bytes:
     try:
-        speech_response = client.audio.speech.create(
+        speech = client.audio.speech.create(
             model="tts-1",
-            voice="shimmer",  # Female-sounding voice
+            voice="nova",  # female-like voice
             input=text
         )
-        audio_path = "output.ogg"
-        with open(audio_path, "wb") as f:
-            f.write(speech_response.content)
-        return audio_path
+        return speech.read()
     except Exception as e:
         print("TTS error:", e)
-        return ""
-
-async def upload_audio_to_whatsapp(file_path: str):
-    url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/media"
-    headers = {
-        "Authorization": f"Bearer {ACCESS_TOKEN}"
-    }
-    data = {
-        "messaging_product": "whatsapp",
-        "type": "audio/ogg"
-    }
-
-    async with httpx.AsyncClient() as client_http:
-        async with aiofiles.open(file_path, "rb") as f:
-            file_data = await f.read()
-
-        files = {
-            "file": ("voice.ogg", file_data, "audio/ogg")
-        }
-
-        response = await client_http.post(url, headers=headers, data=data, files=files)
-        response.raise_for_status()
-        return response.json()["id"]
-
-async def send_audio_reply(user_id: str, media_id: str):
-    url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {ACCESS_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": user_id,
-        "type": "audio",
-        "audio": {"id": media_id}
-    }
-
-    async with httpx.AsyncClient() as client_http:
-        await client_http.post(url, headers=headers, json=payload)
-
-def transliterate_to_hindi(text: str) -> str:
-    try:
-        return GoogleTranslator(source="auto", target="hi").translate(text)
-    except Exception:
-        return text
+        return None
 
 @app.post("/webhook")
 async def webhook(request: Request):
     data = await request.json()
+    print("Incoming data:", data)  # <-- debug line
 
     try:
-        entry = data["entry"][0]
-        changes = entry["changes"][0]["value"]
+        entry = data.get("entry", [{}])[0]
+        changes = entry.get("changes", [{}])[0].get("value", {})
         messages = changes.get("messages")
+
         if not messages:
             print("No message in update.")
-            return {"status": "no message"}
+            return {"status": "ok"}
 
         msg = messages[0]
         user_id = msg["from"]
-        user_text = msg.get("text", {}).get("body")
 
-        if not user_text:
-            print("No text in message")
-            return {"status": "no text"}
+        # Handle text input
+        if "text" in msg:
+            user_text = msg["text"]["body"]
 
-        # Detect if user is typing Roman Hindi and transliterate
-        roman_hindi = transliterate_to_hindi(user_text)
+        # Handle voice input
+        elif msg.get("type") == "audio":
+            media_id = msg["audio"]["id"]
+            media_url = await get_media_url(media_id)
+            if not media_url:
+                return {"status": "media url failed"}
 
+            user_text = await transcribe_voice(media_url)
+            if not user_text:
+                return {"status": "transcription failed"}
+        else:
+            print("Unsupported message type")
+            return {"status": "unsupported"}
+
+        # Load chat history
         record = db.get(UserMemory.user_id == user_id)
         chat_history = record["messages"] if record else []
-        chat_history.append({"role": "user", "content": roman_hindi})
+        chat_history.append({"role": "user", "content": user_text})
 
+        # Prune
         if len(chat_history) > 8:
             summary = await summarize_messages(chat_history)
             chat_history = [{"role": "assistant", "content": summary}]
 
+        # Get reply
         response = client.chat.completions.create(
             model="gpt-3.5-turbo-1106",
             messages=[SYSTEM_PROMPT] + chat_history,
             max_tokens=500
         )
         reply = response.choices[0].message.content.strip()
-
         chat_history.append({"role": "assistant", "content": reply})
+
+        # Save memory
         if record:
             db.update({"messages": chat_history}, UserMemory.user_id == user_id)
         else:
             db.insert({"user_id": user_id, "messages": chat_history})
 
-        # Text-to-speech
-        audio_file = await text_to_speech(reply)
-        if audio_file:
-            media_id = await upload_audio_to_whatsapp(audio_file)
-            await send_audio_reply(user_id, media_id)
-        else:
-            # Fallback to text reply
-            await send_text_reply(user_id, reply)
+        # Generate voice
+        voice_bytes = await generate_voice(reply)
+
+        # Send both text and audio
+        await send_text_message(user_id, reply)
+        if voice_bytes:
+            await send_voice_message(user_id, voice_bytes)
 
     except Exception as e:
         print("Error:", e)
 
     return {"status": "ok"}
 
-async def send_text_reply(user_id: str, reply: str):
+async def get_media_url(media_id: str) -> str:
+    try:
+        url = f"https://graph.facebook.com/v19.0/{media_id}"
+        headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+        async with httpx.AsyncClient() as client_http:
+            res = await client_http.get(url, headers=headers)
+            return res.json().get("url")
+    except Exception as e:
+        print("Media URL fetch error:", e)
+        return None
+
+async def transcribe_voice(media_url: str) -> str:
+    try:
+        headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+        async with httpx.AsyncClient() as client_http:
+            audio_res = await client_http.get(media_url, headers=headers)
+            audio_bytes = audio_res.content
+
+        with open("input.ogg", "wb") as f:
+            f.write(audio_bytes)
+
+        with open("input.ogg", "rb") as f:
+            transcript = client.audio.transcriptions.create(
+                model="whisper-1",
+                file=f
+            )
+            return transcript.text
+    except Exception as e:
+        print("Transcription error:", e)
+        return None
+
+async def send_text_message(user_id: str, text: str):
     url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
     headers = {
         "Authorization": f"Bearer {ACCESS_TOKEN}",
@@ -189,11 +199,41 @@ async def send_text_reply(user_id: str, reply: str):
         "messaging_product": "whatsapp",
         "to": user_id,
         "type": "text",
-        "text": {"body": reply}
+        "text": {"body": text}
     }
-
     async with httpx.AsyncClient() as client_http:
         await client_http.post(url, headers=headers, json=payload)
+
+async def send_voice_message(user_id: str, audio_bytes: bytes):
+    try:
+        # Step 1: Upload media
+        upload_url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/media"
+        headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+        files = {"file": ("voice.ogg", audio_bytes, "audio/ogg")}
+        data = {
+            "messaging_product": "whatsapp",
+            "type": "audio"
+        }
+
+        async with httpx.AsyncClient() as client_http:
+            res = await client_http.post(upload_url, headers=headers, data=data, files=files)
+            media_id = res.json().get("id")
+
+        if not media_id:
+            print("Upload failed")
+            return
+
+        # Step 2: Send audio message
+        msg_url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": user_id,
+            "type": "audio",
+            "audio": {"id": media_id}
+        }
+        await client_http.post(msg_url, headers=headers, json=payload)
+    except Exception as e:
+        print("Voice send error:", e)
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=10000)
