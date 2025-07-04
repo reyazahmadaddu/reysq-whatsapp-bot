@@ -3,5 +3,7 @@ uvicorn
 python-dotenv
 httpx
 openai>=1.0.0
+tinydb
+requests
 pydantic
-
+python-multipart
