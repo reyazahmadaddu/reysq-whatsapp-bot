@@ -8,14 +8,14 @@ from tinydb import TinyDB, Query
 import uvicorn
 import httpx
 import aiofiles
-import uuid
+from deep_translator import GoogleTranslator
 
 # Load environment variables
 load_dotenv()
 
 app = FastAPI()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
@@ -48,7 +48,6 @@ async def verify_webhook(request: Request):
         return int(params.get("hub.challenge"))
     return {"status": "unauthorized"}
 
-
 async def summarize_messages(messages: List[Dict]) -> str:
     try:
         response = client.chat.completions.create(
@@ -63,45 +62,64 @@ async def summarize_messages(messages: List[Dict]) -> str:
     except Exception as e:
         return "Summary failed. Memory cleared."
 
-
-async def generate_voice(reply: str, file_path: str):
+async def text_to_speech(text: str) -> str:
     try:
-        speech = client.audio.speech.create(
+        speech_response = client.audio.speech.create(
             model="tts-1",
-            voice="nova",  # female-style voice
-            input=reply
+            voice="shimmer",  # Female-sounding voice
+            input=text
         )
-        with open(file_path, "wb") as f:
-            f.write(speech.read())
-        return True
+        audio_path = "output.ogg"
+        with open(audio_path, "wb") as f:
+            f.write(speech_response.content)
+        return audio_path
     except Exception as e:
-        print("Voice gen error:", e)
-        return False
-
+        print("TTS error:", e)
+        return ""
 
 async def upload_audio_to_whatsapp(file_path: str):
-    url = "https://graph.facebook.com/v19.0/me/media"
+    url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/media"
     headers = {
         "Authorization": f"Bearer {ACCESS_TOKEN}"
     }
-    params = {
+    data = {
         "messaging_product": "whatsapp",
         "type": "audio/ogg"
     }
 
     async with httpx.AsyncClient() as client_http:
         async with aiofiles.open(file_path, "rb") as f:
-            data = await f.read()
-        files = {'file': ("voice.ogg", data, "audio/ogg")}
-        response = await client_http.post(
-            url,
-            headers=headers,
-            params=params,
-            files=files
-        )
+            file_data = await f.read()
+
+        files = {
+            "file": ("voice.ogg", file_data, "audio/ogg")
+        }
+
+        response = await client_http.post(url, headers=headers, data=data, files=files)
         response.raise_for_status()
         return response.json()["id"]
 
+async def send_audio_reply(user_id: str, media_id: str):
+    url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
+    headers = {
+        "Authorization": f"Bearer {ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": user_id,
+        "type": "audio",
+        "audio": {"id": media_id}
+    }
+
+    async with httpx.AsyncClient() as client_http:
+        await client_http.post(url, headers=headers, json=payload)
+
+def transliterate_to_hindi(text: str) -> str:
+    try:
+        return GoogleTranslator(source="auto", target="hi").translate(text)
+    except Exception:
+        return text
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -112,20 +130,23 @@ async def webhook(request: Request):
         changes = entry["changes"][0]["value"]
         messages = changes.get("messages")
         if not messages:
+            print("No message in update.")
             return {"status": "no message"}
 
         msg = messages[0]
         user_id = msg["from"]
+        user_text = msg.get("text", {}).get("body")
 
-        if msg.get("type") != "text":
+        if not user_text:
             print("No text in message")
-            return {"status": "ignored"}
+            return {"status": "no text"}
 
-        user_text = msg["text"]["body"]
+        # Detect if user is typing Roman Hindi and transliterate
+        roman_hindi = transliterate_to_hindi(user_text)
 
         record = db.get(UserMemory.user_id == user_id)
         chat_history = record["messages"] if record else []
-        chat_history.append({"role": "user", "content": user_text})
+        chat_history.append({"role": "user", "content": roman_hindi})
 
         if len(chat_history) > 8:
             summary = await summarize_messages(chat_history)
@@ -144,45 +165,35 @@ async def webhook(request: Request):
         else:
             db.insert({"user_id": user_id, "messages": chat_history})
 
-        # Temp file path
-        voice_file = f"voice_{uuid.uuid4().hex}.ogg"
-
-        async with httpx.AsyncClient() as client_http:
-            # 1. Send text message
-            url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
-            headers = {
-                "Authorization": f"Bearer {ACCESS_TOKEN}",
-                "Content-Type": "application/json"
-            }
-            payload = {
-                "messaging_product": "whatsapp",
-                "to": user_id,
-                "type": "text",
-                "text": {"body": reply}
-            }
-            await client_http.post(url, headers=headers, json=payload)
-
-            # 2. Generate voice and send audio
-            if await generate_voice(reply, voice_file):
-                media_id = await upload_audio_to_whatsapp(voice_file)
-
-                audio_payload = {
-                    "messaging_product": "whatsapp",
-                    "to": user_id,
-                    "type": "audio",
-                    "audio": {
-                        "id": media_id
-                    }
-                }
-                await client_http.post(url, headers=headers, json=audio_payload)
-
-        os.remove(voice_file)
+        # Text-to-speech
+        audio_file = await text_to_speech(reply)
+        if audio_file:
+            media_id = await upload_audio_to_whatsapp(audio_file)
+            await send_audio_reply(user_id, media_id)
+        else:
+            # Fallback to text reply
+            await send_text_reply(user_id, reply)
 
     except Exception as e:
         print("Error:", e)
 
     return {"status": "ok"}
 
+async def send_text_reply(user_id: str, reply: str):
+    url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
+    headers = {
+        "Authorization": f"Bearer {ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": user_id,
+        "type": "text",
+        "text": {"body": reply}
+    }
+
+    async with httpx.AsyncClient() as client_http:
+        await client_http.post(url, headers=headers, json=payload)
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=10000)
