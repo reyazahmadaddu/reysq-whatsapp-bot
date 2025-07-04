@@ -9,4 +9,3 @@ pydantic
 aiofiles
 python-multipart
 deep-translator
-
