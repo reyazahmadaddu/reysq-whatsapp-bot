@@ -6,5 +6,7 @@ openai>=1.0.0
 tinydb
 requests
 pydantic
-python-multipart
 aiofiles
+python-multipart
+deep-translator
+
