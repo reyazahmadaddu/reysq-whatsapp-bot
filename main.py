@@ -57,29 +57,25 @@ async def verify_webhook(request: Request):
     return {"status": "unauthorized"}
 
 async def summarize_messages(messages: List[Dict]) -> str:
-    
+    summarize_prompt = {
+        "role": "system",
+        "content": (
+            "Summarize the emotional and clinical content of this conversation so far, "
+            "and leave out any irrelevant or resolved topics. "
+            "Only retain info that affects upcoming replies."
+        )
+    }
 
-summarize_prompt = {
-    "role": "system",
-    "content": (
-        "Summarize the emotional and clinical content of this conversation so far, "
-        "and leave out any irrelevant or resolved topics. "
-        "Only retain info that affects upcoming replies."
-    )
-}
-
-try:
-    response = client.chat.completions.create(
-        model="gpt-3.5-turbo-1106",
-        messages=[summarize_prompt] + messages,
-        max_tokens=150
-    )
-
-
-    
+    try:
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo-1106",
+            messages=[summarize_prompt] + messages,
+            max_tokens=150
+        )
         return response.choices[0].message.content.strip()
     except Exception as e:
         return "Summary failed. Memory cleared."
+
 
 async def transcribe_audio(media_id: str) -> str:
     # Step 1: Get media URL
