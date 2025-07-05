@@ -51,8 +51,8 @@ async def summarize_messages(messages: List[Dict]) -> str:
     try:
         response = client.chat.completions.create(
             model="gpt-3.5-turbo-1106",
-            messages=[{"role": "system", "content": ""Summarize the emotional and clinical content of this conversation so far, and leave out any irrelevant or resolved topics. Only retain info that affects upcoming replies."
-"}] + messages,
+            messages=[{"role": "system", "content": "Summarize the emotional and clinical content of this conversation so far, and leave out any irrelevant or resolved topics. Only retain info that affects upcoming replies."
+}] + messages,
             max_tokens=150
         )
         return response.choices[0].message.content.strip()
