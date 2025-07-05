@@ -8,10 +8,10 @@ from tinydb import TinyDB, Query
 import uvicorn
 import httpx
 import tempfile
-import asyncio
 
-# Load environment
+# Load environment variables
 load_dotenv()
+
 app = FastAPI()
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -40,6 +40,15 @@ Keep replies short enough to be sent via WhatsApp.
 """
 }
 
+WELCOME_MESSAGE = (
+    "👋 Hey there! I'm *ReysQ*, your personal AI health companion.\n\n"
+    "🧠 I'm trained to listen to your health concerns, guide you step-by-step, "
+    "and even remember how you've been feeling.\n\n"
+    "🚑 I offer safe home remedies, early advice, and emotional support — 24/7.\n\n"
+    "I was built with care, to make healthcare accessible and kind.\n"
+    "So… how are you feeling today?"
+)
+
 @app.get("/")
 async def verify_webhook(request: Request):
     params = dict(request.query_params)
@@ -51,8 +60,17 @@ async def summarize_messages(messages: List[Dict]) -> str:
     try:
         response = client.chat.completions.create(
             model="gpt-3.5-turbo-1106",
-            messages=[{"role": "system", "content": "Summarize the emotional and clinical content of this conversation so far, and leave out any irrelevant or resolved topics. Only retain info that affects upcoming replies."
-}] + messages,
+
+
+summarize_prompt = {
+    "role": "system",
+    "content": (
+        "Summarize the emotional and clinical content of this conversation so far, "
+        "and leave out any irrelevant or resolved topics. "
+        "Only retain info that affects upcoming replies."
+    )
+}
+messages = [summarize_prompt] + messages,
             max_tokens=150
         )
         return response.choices[0].message.content.strip()
@@ -106,17 +124,40 @@ async def webhook(request: Request):
         else:
             user_text = "Unsupported message type."
 
-        # Retrieve memory
+        # Check if new user
         record = db.get(UserMemory.user_id == user_id)
-        chat_history = record["messages"] if record else []
+        if not record:
+            # Send welcome message once
+            headers = {
+                "Authorization": f"Bearer {ACCESS_TOKEN}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "messaging_product": "whatsapp",
+                "to": user_id,
+                "type": "text",
+                "text": {"body": WELCOME_MESSAGE}
+            }
+            async with httpx.AsyncClient() as client_http:
+                await client_http.post(
+                    f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages",
+                    headers=headers,
+                    json=payload
+                )
+            # Create memory for this user
+            db.insert({"user_id": user_id, "messages": []})
+            record = db.get(UserMemory.user_id == user_id)
+
+        # Retrieve memory
+        chat_history = record["messages"]
         chat_history.append({"role": "user", "content": user_text})
 
-        # Prune
+        # Summarize if history too long
         if len(chat_history) > 8:
             summary = await summarize_messages(chat_history)
             chat_history = [{"role": "assistant", "content": summary}]
 
-        # GPT response
+        # Get response from GPT
         response = client.chat.completions.create(
             model="gpt-3.5-turbo-1106",
             messages=[SYSTEM_PROMPT] + chat_history,
@@ -126,10 +167,7 @@ async def webhook(request: Request):
 
         # Save memory
         chat_history.append({"role": "assistant", "content": reply})
-        if record:
-            db.update({"messages": chat_history}, UserMemory.user_id == user_id)
-        else:
-            db.insert({"user_id": user_id, "messages": chat_history})
+        db.update({"messages": chat_history}, UserMemory.user_id == user_id)
 
         # Send reply to WhatsApp
         headers = {
