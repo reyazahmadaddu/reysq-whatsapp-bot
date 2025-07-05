@@ -57,10 +57,7 @@ async def verify_webhook(request: Request):
     return {"status": "unauthorized"}
 
 async def summarize_messages(messages: List[Dict]) -> str:
-    try:
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo-1106",
-
+    
 
 summarize_prompt = {
     "role": "system",
@@ -70,9 +67,16 @@ summarize_prompt = {
         "Only retain info that affects upcoming replies."
     )
 }
-messages = [summarize_prompt] + messages,
-            max_tokens=150
-        )
+
+try:
+    response = client.chat.completions.create(
+        model="gpt-3.5-turbo-1106",
+        messages=[summarize_prompt] + messages,
+        max_tokens=150
+    )
+
+
+    
         return response.choices[0].message.content.strip()
     except Exception as e:
         return "Summary failed. Memory cleared."
