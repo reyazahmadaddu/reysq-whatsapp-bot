@@ -189,7 +189,7 @@ async def keep_alive():
                         print("Pinged self")
             except Exception as e:
                 print("Ping failed:", e)
-            await asyncio.sleep(840)  # 14 mins
+            await asyncio.sleep(780)  # 13 mins
     asyncio.create_task(ping())
 
 if __name__ == "__main__":
