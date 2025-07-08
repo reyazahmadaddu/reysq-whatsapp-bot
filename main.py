@@ -1,46 +1,57 @@
 import os
 import time
-from openai import OpenAI
-from fastapi import FastAPI, Request
-from dotenv import load_dotenv
-from pydantic import BaseModel
-from typing import List, Dict
-from tinydb import TinyDB, Query
-import uvicorn
 import httpx
 import tempfile
-from datetime import datetime, timedelta
+from fastapi import FastAPI, Request
+from pydantic import BaseModel
+from typing import List, Dict
+from dotenv import load_dotenv
+from openai import OpenAI
+from tinydb import TinyDB, Query
+import uvicorn
 
-# Load environment variables
+# Load env vars
 load_dotenv()
 
 app = FastAPI()
-
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
+PING_URL = os.getenv("PING_URL")  # Add your Render URL here
 
-# DB
+# DB Setup
 db = TinyDB("memory.json")
 UserMemory = Query()
 
-# SYSTEM PROMPT
+# ReysQ System Prompt
 SYSTEM_PROMPT = {
     "role": "system",
     "content": """
-You are *ReysQ* — a warm, emotionally intelligent AI health companion.
-Your job is to assist users in understanding their symptoms with clarity and empathy — not to give medical advice.
-You always receive the last 8 messages (excluding the most recent one). Treat them as your memory.
+You are *ReysQ* — a warm, emotionally intelligent AI health companion, like a friendly pocket doctor who remembers how the user has been feeling recently.
+
+Your job is to assist users in understanding their symptoms and concerns with empathy, clarity, and emotional support — not to give medical advice or make diagnoses.
+
+🩺 You are trained in medical triage and conversational flow.
+
+Your goal:
+- Ask kind, relevant follow-up questions to better understand the user’s symptoms
+- Guide them step-by-step through safe, helpful suggestions
+- Offer a 2–3 day care plan for mild symptoms, and flag serious ones gently
+- Assist in scheduling a doctor visit, finding a clinic, or preparing for a consultation if needed
 
 🎯 Your flow:
-- Greet users kindly and ask whether their concern is about symptoms, conditions, lab results, or meds.
-- Ask kind follow-up questions to understand their symptoms better.
-- Offer a 2–3 day home care plan if mild.
-- Recommend a doctor visit if serious.
-- Never repeat empathy too much.
-- Close warmly but avoid spamming.
-    """
+1. Greet users kindly and ask whether their concern is about symptoms, conditions, lab results, medications, or something else.
+2. If symptoms: ask what they are, and then progressively narrow with clear, relevant questions (e.g., color, duration, pain, pattern, triggers).
+3. Share what such symptoms *may* indicate — but only as helpful context, not a diagnosis.
+4. Recommend seeing a doctor if symptoms are ongoing, serious, or unusual.
+5. Offer help booking a doctor or preparing for the visit (what to say, bring, expect).
+6. Always sound reassuring, warm, and conversational — like a kind friend, not a robot.
+
+📝 Keep replies short and human, suitable for WhatsApp. Avoid jargon unless necessary. No copy-paste disclaimers — just say when medical help is needed.
+
+🎁 Close every chat with a hopeful, supportive note. You are their pocket doctor and gentle health guide.
+"""
 }
 
 WELCOME_MESSAGE = (
@@ -50,40 +61,40 @@ WELCOME_MESSAGE = (
     "So… what’s on your mind today? Symptoms, lab results, medications, or something else?"
 )
 
-async def summarize_messages(messages: List[Dict]) -> str:
-    summarize_prompt = {
-        "role": "system",
-        "content": "Summarize the key clinical and emotional details. Leave out anything already resolved or irrelevant."
-    }
+JUNK_INPUTS = {"hmm", "kya hua", "?", "."}
+
+async def summarize_conversation(summary: str, recent_msgs: List[Dict]) -> str:
+    messages = [
+        {"role": "system", "content": "Update the summary with recent messages. Keep it under 100 words."},
+        {"role": "assistant", "content": f"Previous summary: {summary}"},
+        *recent_msgs
+    ]
     try:
         response = client.chat.completions.create(
             model="gpt-3.5-turbo-1106",
-            messages=[summarize_prompt] + messages,
+            messages=messages,
             max_tokens=150
         )
         return response.choices[0].message.content.strip()
     except:
-        return "Summary failed."
+        return summary  # fallback to old summary
 
 async def transcribe_audio(media_id: str) -> str:
     url = f"https://graph.facebook.com/v19.0/{media_id}"
     headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
-    async with httpx.AsyncClient() as client_http:
-        res = await client_http.get(url, headers=headers)
+    async with httpx.AsyncClient() as http:
+        res = await http.get(url, headers=headers)
         media_url = res.json().get("url")
-        media_res = await client_http.get(media_url, headers=headers)
+        media = await http.get(media_url, headers=headers)
         with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as tmp:
-            tmp.write(media_res.content)
-            tmp_path = tmp.name
-    with open(tmp_path, "rb") as audio_file:
-        transcript = client.audio.transcriptions.create(
-            model="whisper-1",
-            file=audio_file
-        )
+            tmp.write(media.content)
+            path = tmp.name
+    with open(path, "rb") as audio:
+        transcript = client.audio.transcriptions.create(model="whisper-1", file=audio)
     return transcript.text
 
 @app.get("/")
-async def verify_webhook(request: Request):
+async def verify(request: Request):
     params = dict(request.query_params)
     if params.get("hub.verify_token") == VERIFY_TOKEN:
         return int(params.get("hub.challenge"))
@@ -93,95 +104,93 @@ async def verify_webhook(request: Request):
 async def webhook(request: Request):
     data = await request.json()
     try:
-        entry = data.get("entry", [{}])[0]
-        changes = entry.get("changes", [{}])[0].get("value", {})
-        messages = changes.get("messages")
-        if not messages:
-            return {"status": "no message"}
-
-        msg = messages[0]
-        user_id = msg.get("from")
+        msg = data["entry"][0]["changes"][0]["value"].get("messages", [])[0]
+        user_id = msg["from"]
         msg_type = msg.get("type")
-
-        if not user_id:
-            return {"status": "invalid user"}
-
-        if msg_type == "text":
-            user_text = msg.get("text", {}).get("body", "")
-        elif msg_type == "audio":
-            media_id = msg.get("audio", {}).get("id")
-            user_text = await transcribe_audio(media_id)
-        else:
-            return {"status": "unsupported type"}
-
-        # Ignore meaningless texts
-        if user_text.strip().lower() in ["", "hmm", "haan", "?", "kya", "hmmmm", "ok"]:
+        text = msg["text"]["body"] if msg_type == "text" else await transcribe_audio(msg["audio"]["id"])
+        if text.lower().strip() in JUNK_INPUTS:
             return {"status": "ignored"}
 
-        # Fetch or initialize memory
         record = db.get(UserMemory.user_id == user_id)
-        if not record:
-            headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
-            payload = {
-                "messaging_product": "whatsapp",
-                "to": user_id,
-                "type": "text",
-                "text": {"body": WELCOME_MESSAGE}
-            }
-            async with httpx.AsyncClient() as client_http:
-                await client_http.post(f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages", headers=headers, json=payload)
-            db.insert({"user_id": user_id, "messages": [], "last_reply_time": time.time()})
-            record = db.get(UserMemory.user_id == user_id)
+        now = time.time()
 
-        # Cooldown check: skip reply if already responded in last 30s
-        if time.time() - record.get("last_reply_time", 0) < 30:
+        if record and now - record.get("last_reply_time", 0) < 30:
             return {"status": "cooldown"}
 
-        chat_history = record["messages"]
-        if len(chat_history) > 8:
-            summary = await summarize_messages(chat_history)
-            chat_history = [{"role": "assistant", "content": f"Summary so far: {summary}"}]
+        if not record:
+            record = {
+                "user_id": user_id,
+                "summary": "",
+                "recent_messages": [],
+                "last_reply_time": now
+            }
+            db.insert(record)
+            await send_whatsapp(user_id, WELCOME_MESSAGE)
 
-        chat_history.append({"role": "user", "content": user_text})
+        # Build memory
+        summary = record.get("summary", "")
+        recent = record.get("recent_messages", [])
+        recent.append({"role": "user", "content": text})
+
+        context = [
+            {"role": "assistant", "content": f"Summary so far: {summary}"},
+            *recent
+        ]
 
         response = client.chat.completions.create(
             model="gpt-3.5-turbo-1106",
-            messages=[SYSTEM_PROMPT] + chat_history,
+            messages=[SYSTEM_PROMPT] + context,
             max_tokens=500
         )
         reply = response.choices[0].message.content.strip()
 
-        chat_history.append({"role": "assistant", "content": reply})
-        db.update({"messages": chat_history, "last_reply_time": time.time()}, UserMemory.user_id == user_id)
+        recent.append({"role": "assistant", "content": reply})
 
-        headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
-        payload = {
-            "messaging_product": "whatsapp",
-            "to": user_id,
-            "type": "text",
-            "text": {"body": reply}
-        }
-        async with httpx.AsyncClient() as client_http:
-            await client_http.post(f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages", headers=headers, json=payload)
+        if len(recent) > 10:
+            summary = await summarize_conversation(summary, recent)
+            recent = []
+
+        db.update({
+            "summary": summary,
+            "recent_messages": recent,
+            "last_reply_time": now
+        }, UserMemory.user_id == user_id)
+
+        await send_whatsapp(user_id, reply)
 
     except Exception as e:
         print("Error:", e)
     return {"status": "ok"}
 
-# Optional: keep app alive with self-ping (but no reply)
-import asyncio
+async def send_whatsapp(user_id: str, msg: str):
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": user_id,
+        "type": "text",
+        "text": {"body": msg}
+    }
+    headers = {
+        "Authorization": f"Bearer {ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    async with httpx.AsyncClient() as http:
+        await http.post(f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages", headers=headers, json=payload)
 
+# Self-ping every 14 minutes
+import asyncio
 @app.on_event("startup")
 async def keep_alive():
-    async def ping_loop():
+    async def ping():
         while True:
             try:
-                async with httpx.AsyncClient() as client:
-                    await client.get("https://your-fly-app.fly.dev/")  # Replace with your domain
-            except:
-                pass
-            await asyncio.sleep(600)
-    asyncio.create_task(ping_loop())
+                if PING_URL:
+                    async with httpx.AsyncClient() as http:
+                        await http.get(PING_URL)
+                        print("Pinged self")
+            except Exception as e:
+                print("Ping failed:", e)
+            await asyncio.sleep(840)  # 14 mins
+    asyncio.create_task(ping())
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=10000)
