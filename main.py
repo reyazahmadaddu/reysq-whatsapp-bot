@@ -1,27 +1,32 @@
 import os
-from openai import OpenAI
+import asyncio
+import tempfile
 from fastapi import FastAPI, Request
 from dotenv import load_dotenv
 from pydantic import BaseModel
 from typing import List, Dict
 from tinydb import TinyDB, Query
-import uvicorn
+from openai import OpenAI
 import httpx
-import tempfile
+import uvicorn
 
 # Load environment variables
 load_dotenv()
 
+# Initialize app
 app = FastAPI()
 
+# Environment configs
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 
+# In-memory DB
 db = TinyDB("memory.json")
 UserMemory = Query()
 
+# System prompt for reysQ AI Pocket Doctor
 SYSTEM_PROMPT = {
     "role": "system",
     "content": """
@@ -53,6 +58,7 @@ Your goal:
 """
 }
 
+# Welcome message sent only once
 WELCOME_MESSAGE = (
     "👋 Hi there! I’m *ReysQ*, your AI-enabled Pocket Doctor.\n\n"
     "🧠 I’m here to listen, track how you’re feeling, and guide you through your health concerns — step by step.\n\n"
@@ -60,6 +66,7 @@ WELCOME_MESSAGE = (
     "So… what’s on your mind today? Symptoms, lab results, medications, or something else?"
 )
 
+# Webhook verification for WhatsApp
 @app.get("/")
 async def verify_webhook(request: Request):
     params = dict(request.query_params)
@@ -67,6 +74,7 @@ async def verify_webhook(request: Request):
         return int(params.get("hub.challenge"))
     return {"status": "unauthorized"}
 
+# Summarize past chat messages for memory management
 async def summarize_messages(messages: List[Dict]) -> str:
     summarize_prompt = {
         "role": "system",
@@ -87,22 +95,17 @@ async def summarize_messages(messages: List[Dict]) -> str:
     except Exception as e:
         return "Summary failed. Memory cleared."
 
-
+# Handle voice message transcription using Whisper
 async def transcribe_audio(media_id: str) -> str:
-    # Step 1: Get media URL
     url = f"https://graph.facebook.com/v19.0/{media_id}"
     headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
     async with httpx.AsyncClient() as client_http:
         res = await client_http.get(url, headers=headers)
         media_url = res.json().get("url")
-
-        # Step 2: Download the audio file
         media_res = await client_http.get(media_url, headers=headers)
         with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as tmp:
             tmp.write(media_res.content)
             tmp_path = tmp.name
-
-    # Step 3: Transcribe with Whisper
     with open(tmp_path, "rb") as audio_file:
         transcript = client.audio.transcriptions.create(
             model="whisper-1",
@@ -110,10 +113,10 @@ async def transcribe_audio(media_id: str) -> str:
         )
     return transcript.text
 
+# Handle WhatsApp incoming messages
 @app.post("/webhook")
 async def webhook(request: Request):
     data = await request.json()
-
     try:
         entry = data["entry"][0]
         changes = entry["changes"][0]["value"]
@@ -127,78 +130,66 @@ async def webhook(request: Request):
 
         if msg_type == "text":
             user_text = msg["text"]["body"]
-
         elif msg_type == "audio":
             media_id = msg["audio"]["id"]
             user_text = await transcribe_audio(media_id)
-
         else:
             user_text = "Unsupported message type."
 
-        # Check if new user
+        # Check for new user
         record = db.get(UserMemory.user_id == user_id)
         if not record:
-            # Send welcome message once
-            headers = {
-                "Authorization": f"Bearer {ACCESS_TOKEN}",
-                "Content-Type": "application/json"
-            }
-            payload = {
-                "messaging_product": "whatsapp",
-                "to": user_id,
-                "type": "text",
-                "text": {"body": WELCOME_MESSAGE}
-            }
-            async with httpx.AsyncClient() as client_http:
-                await client_http.post(
-                    f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages",
-                    headers=headers,
-                    json=payload
-                )
-            # Create memory for this user
+            await send_whatsapp_message(user_id, WELCOME_MESSAGE)
             db.insert({"user_id": user_id, "messages": []})
             record = db.get(UserMemory.user_id == user_id)
 
-        # Retrieve memory
         chat_history = record["messages"]
         chat_history.append({"role": "user", "content": user_text})
 
-        # Summarize if history too long
         if len(chat_history) > 8:
             summary = await summarize_messages(chat_history)
             chat_history = [{"role": "assistant", "content": summary}]
 
-        # Get response from GPT
         response = client.chat.completions.create(
             model="gpt-3.5-turbo-1106",
             messages=[SYSTEM_PROMPT] + chat_history,
             max_tokens=500
         )
         reply = response.choices[0].message.content.strip()
-
-        # Save memory
         chat_history.append({"role": "assistant", "content": reply})
         db.update({"messages": chat_history}, UserMemory.user_id == user_id)
 
-        # Send reply to WhatsApp
-        headers = {
-            "Authorization": f"Bearer {ACCESS_TOKEN}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "messaging_product": "whatsapp",
-            "to": user_id,
-            "type": "text",
-            "text": {"body": reply}
-        }
-
-        async with httpx.AsyncClient() as client_http:
-            await client_http.post(f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages", headers=headers, json=payload)
+        await send_whatsapp_message(user_id, reply)
 
     except Exception as e:
         print("Error:", e)
 
     return {"status": "ok"}
 
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=10000)
+# Helper: Send message to WhatsApp user
+async def send_whatsapp_message(user_id: str, text: str):
+    headers = {
+        "Authorization": f"Bearer {ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": user_id,
+        "type": "text",
+        "text": {"body": text}
+    }
+    async with httpx.AsyncClient() as client_http:
+        await client_http.post(
+            f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages",
+            headers=headers,
+            json=payload
+        )
+
+# Background task to keep app alive
+@app.on_event("startup")
+async def keep_alive():
+    asyncio.create_task(run_forever())
+
+async def run_forever():
+    while True:
+        await asyncio.sleep(3600)  # Keeps app alive
