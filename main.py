@@ -3,7 +3,6 @@ import asyncio
 import tempfile
 from fastapi import FastAPI, Request
 from dotenv import load_dotenv
-from pydantic import BaseModel
 from typing import List, Dict
 from tinydb import TinyDB, Query
 from openai import OpenAI
@@ -13,20 +12,20 @@ import uvicorn
 # Load environment variables
 load_dotenv()
 
-# Initialize app
+# FastAPI app
 app = FastAPI()
 
-# Environment configs
+# Initialize OpenAI + Env Vars
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 
-# In-memory DB
+# Local storage
 db = TinyDB("memory.json")
 UserMemory = Query()
 
-# System prompt for reysQ AI Pocket Doctor
+# Core personality
 SYSTEM_PROMPT = {
     "role": "system",
     "content": """
@@ -58,7 +57,6 @@ Your goal:
 """
 }
 
-# Welcome message sent only once
 WELCOME_MESSAGE = (
     "👋 Hi there! I’m *ReysQ*, your AI-enabled Pocket Doctor.\n\n"
     "🧠 I’m here to listen, track how you’re feeling, and guide you through your health concerns — step by step.\n\n"
@@ -66,7 +64,8 @@ WELCOME_MESSAGE = (
     "So… what’s on your mind today? Symptoms, lab results, medications, or something else?"
 )
 
-# Webhook verification for WhatsApp
+
+# WhatsApp verification endpoint
 @app.get("/")
 async def verify_webhook(request: Request):
     params = dict(request.query_params)
@@ -74,14 +73,15 @@ async def verify_webhook(request: Request):
         return int(params.get("hub.challenge"))
     return {"status": "unauthorized"}
 
-# Summarize past chat messages for memory management
+
+# Summarize chat history into long-term memory
 async def summarize_messages(messages: List[Dict]) -> str:
     summarize_prompt = {
         "role": "system",
         "content": (
-            "Summarize the emotional and clinical content of this conversation so far, "
-            "and leave out any irrelevant or resolved topics. "
-            "Only retain info that affects upcoming replies."
+            "Summarize the emotional and clinical content of this conversation so far. "
+            "Leave out resolved or irrelevant content. "
+            "Summarize in a way that helps the assistant continue the conversation with full context."
         )
     }
 
@@ -95,7 +95,8 @@ async def summarize_messages(messages: List[Dict]) -> str:
     except Exception as e:
         return "Summary failed. Memory cleared."
 
-# Handle voice message transcription using Whisper
+
+# Transcribe audio messages
 async def transcribe_audio(media_id: str) -> str:
     url = f"https://graph.facebook.com/v19.0/{media_id}"
     headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
@@ -113,10 +114,12 @@ async def transcribe_audio(media_id: str) -> str:
         )
     return transcript.text
 
-# Handle WhatsApp incoming messages
+
+# Handle incoming WhatsApp messages
 @app.post("/webhook")
 async def webhook(request: Request):
     data = await request.json()
+
     try:
         entry = data["entry"][0]
         changes = entry["changes"][0]["value"]
@@ -136,29 +139,49 @@ async def webhook(request: Request):
         else:
             user_text = "Unsupported message type."
 
-        # Check for new user
+        # Get or create user record
         record = db.get(UserMemory.user_id == user_id)
         if not record:
             await send_whatsapp_message(user_id, WELCOME_MESSAGE)
-            db.insert({"user_id": user_id, "messages": []})
+            db.insert({"user_id": user_id, "messages": [], "summary": ""})
             record = db.get(UserMemory.user_id == user_id)
 
         chat_history = record["messages"]
+        user_summary = record.get("summary", "")
+
+        # Add latest message
         chat_history.append({"role": "user", "content": user_text})
 
+        # Summarize when chat gets long
         if len(chat_history) > 8:
-            summary = await summarize_messages(chat_history)
-            chat_history = [{"role": "assistant", "content": summary}]
+            updated_summary = await summarize_messages(chat_history)
+            user_summary = updated_summary
+            chat_history = chat_history[-6:]  # Keep last few turns only
+            db.update({"summary": user_summary, "messages": chat_history}, UserMemory.user_id == user_id)
 
-        response = client.chat.completions.create(
+        # Memory-aware system message
+        summary_prompt = {
+            "role": "system",
+            "content": (
+                f"Here’s the summary of the user's health journey so far:\n\n"
+                f"{user_summary}\n\n"
+                f"Use this to maintain full context and respond empathetically and accurately."
+            )
+        }
+
+        # Get reply from OpenAI
+        gpt_response = client.chat.completions.create(
             model="gpt-3.5-turbo-1106",
-            messages=[SYSTEM_PROMPT] + chat_history,
+            messages=[SYSTEM_PROMPT, summary_prompt] + chat_history,
             max_tokens=500
         )
-        reply = response.choices[0].message.content.strip()
+        reply = gpt_response.choices[0].message.content.strip()
+
+        # Save assistant reply to memory
         chat_history.append({"role": "assistant", "content": reply})
         db.update({"messages": chat_history}, UserMemory.user_id == user_id)
 
+        # Send to WhatsApp
         await send_whatsapp_message(user_id, reply)
 
     except Exception as e:
@@ -166,7 +189,8 @@ async def webhook(request: Request):
 
     return {"status": "ok"}
 
-# Helper: Send message to WhatsApp user
+
+# WhatsApp message sender
 async def send_whatsapp_message(user_id: str, text: str):
     headers = {
         "Authorization": f"Bearer {ACCESS_TOKEN}",
@@ -185,11 +209,12 @@ async def send_whatsapp_message(user_id: str, text: str):
             json=payload
         )
 
-# Background task to keep app alive
+
+# Keeps Render app alive (optional but recommended)
 @app.on_event("startup")
 async def keep_alive():
     asyncio.create_task(run_forever())
 
 async def run_forever():
     while True:
-        await asyncio.sleep(3600)  # Keeps app alive
+        await asyncio.sleep(3600)
