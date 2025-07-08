@@ -58,13 +58,6 @@ WELCOME_MESSAGE = (
     "🧠 I’m here to listen, track how you’re feeling, and guide you through your health concerns — step by step.\n\n"
     "💡 I can help with symptoms, medications, test results, and more — always with a warm touch.\n\n"
     "So… what’s on your mind today? Symptoms, lab results, medications, or something else?"
-}
-
-WELCOME_MESSAGE = (
-    "👋 Hi there! I’m *ReysQ*, your AI-enabled Pocket Doctor.\n\n"
-    "🧠 I’m here to listen, track how you’re feeling, and guide you through your health concerns — step by step.\n\n"
-    "💡 I can help with symptoms, medications, test results, and more — always with a warm touch.\n\n"
-    "So… what’s on your mind today? Symptoms, lab results, medications, or something else?"
 )
 
 @app.get("/")
